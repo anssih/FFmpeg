@@ -101,6 +101,9 @@ struct playlist {
     char key_url[MAX_URL_SIZE];
     uint8_t key[16];
 
+    int is_subtitle;
+    int reopen_subtitle;
+
     int is_id3_timestamped; /* -1: not yet known */
     int64_t id3_mpegts_timestamp; /* in mpegts tb */
     int64_t id3_offset; /* in stream original tb */
@@ -373,9 +376,12 @@ static struct rendition *new_rendition(HLSContext *c, struct rendition_info *inf
     /* add the playlist if this is an external rendition */
     if (info->uri[0]) {
         rend->playlist = new_playlist(c, info->uri, url_base);
-        if (rend->playlist)
+        if (rend->playlist) {
             dynarray_add(&rend->playlist->renditions,
                          &rend->playlist->n_renditions, rend);
+            if (type == AVMEDIA_TYPE_SUBTITLE)
+                rend->playlist->is_subtitle = 1;
+        }
     }
 
     if (info->assoc_language[0]) {
@@ -727,6 +733,14 @@ cleanup:
     return ret;
 }
 
+static void after_segment_switch(struct playlist *pls)
+{
+    /* subtitle demuxers may try to consume the entire stream, so report
+     * EOF to them on segment switches and reopen on next request */
+    if (pls->is_subtitle && pls->ctx)
+        pls->reopen_subtitle = 1;
+}
+
 static int read_data(void *opaque, uint8_t *buf, int buf_size)
 {
     struct playlist *v = opaque;
@@ -736,7 +750,7 @@ static int read_data(void *opaque, uint8_t *buf, int buf_size)
     int just_opened = 0;
     struct segment *seg;
 
-    if (!v->needed)
+    if (!v->needed || v->reopen_subtitle)
         return AVERROR_EOF;
 
 restart:
@@ -822,6 +836,7 @@ reload:
 
     c->end_of_segment = 1;
     c->cur_seq_no = v->cur_seq_no;
+    after_segment_switch(v);
 
     if (v->ctx && v->ctx->nb_streams &&
         v->parent->nb_streams >= v->stream_offset + v->ctx->nb_streams) {
@@ -1131,6 +1146,7 @@ static int recheck_discard_flags(AVFormatContext *s, int first)
             changed = 1;
             pls->cur_seq_no = c->cur_seq_no;
             pls->pb.eof_reached = 0;
+            after_segment_switch(pls);
             av_log(s, AV_LOG_INFO, "Now receiving playlist %d\n", i);
         } else if (first && !pls->cur_needed && pls->needed) {
             if (pls->input)
@@ -1174,10 +1190,27 @@ start:
                 int64_t ts_diff;
                 AVRational tb;
                 ret = av_read_frame(pls->ctx, &pls->pkt);
+
                 if (ret < 0) {
                     if (!url_feof(&pls->pb) && ret != AVERROR_EOF)
                         return ret;
                     reset_packet(&pls->pkt);
+
+                    if (pls->reopen_subtitle) {
+                        /* each subtitle segment is demuxed separately */
+                        struct AVInputFormat *ifmt = pls->ctx->iformat;
+
+                        pls->reopen_subtitle = 0;
+                        pls->ctx->pb = NULL;
+                        avformat_close_input(&pls->ctx);
+                        if (!(pls->ctx = avformat_alloc_context()))
+                            return AVERROR(ENOMEM);
+
+                        pls->ctx->pb = &pls->pb;
+                        avformat_open_input(&pls->ctx, NULL, ifmt, NULL);
+                        continue;
+                    }
+
                     break;
                 } else {
                     if (pls->is_id3_timestamped) {
