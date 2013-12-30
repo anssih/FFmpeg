@@ -1181,7 +1181,8 @@ static int find_timestamp_in_playlist(HLSContext *c, struct playlist *pls,
 
     for (i = 0; i < pls->n_segments; i++) {
         int64_t diff = pos + pls->segments[i]->duration - timestamp;
-        if (diff > 0) {
+        /* if we are within 100ms of segment end, just select the next segment */
+        if (diff > 0 && (diff >= AV_TIME_BASE/10 || i == pls->n_segments - 1)) {
             *seq_no = pls->start_seq_no + i;
             return 1;
         }
