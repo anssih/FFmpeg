@@ -82,6 +82,12 @@ enum PlaylistType {
     PLS_TYPE_VOD
 };
 
+enum Reopen {
+    NO_REOPEN,
+    REOPEN_AFTER_CONSUMED,
+    REOPEN_BEFORE_READ,
+};
+
 /*
  * Each playlist has its own demuxer. If it currently is active,
  * it has an open AVIOContext too, and potentially an AVPacket
@@ -123,6 +129,9 @@ struct playlist {
     int id3_found; /* ID3 tag found at some point */
     int id3_changed; /* ID3 tag data has changed at some point */
     ID3v2ExtraMeta *id3_deferred_extra; /* stored here until subdemuxer is opened */
+
+    int is_subtitle;
+    enum Reopen reopen_subtitle;
 
     int64_t seek_timestamp;
     int seek_flags;
@@ -402,9 +411,12 @@ static struct rendition *new_rendition(HLSContext *c, struct rendition_info *inf
     /* add the playlist if this is an external rendition */
     if (info->uri[0]) {
         rend->playlist = new_playlist(c, info->uri, url_base);
-        if (rend->playlist)
+        if (rend->playlist) {
             dynarray_add(&rend->playlist->renditions,
                          &rend->playlist->n_renditions, rend);
+            if (type == AVMEDIA_TYPE_SUBTITLE)
+                rend->playlist->is_subtitle = 1;
+        }
     }
 
     if (info->assoc_language[0]) {
@@ -973,6 +985,14 @@ cleanup:
     return ret;
 }
 
+static void after_segment_switch(struct playlist *pls)
+{
+    /* subtitle demuxers may try to consume the entire stream, so report
+     * EOF to them on segment switches and reopen on next request */
+    if (pls->is_subtitle && pls->ctx)
+        pls->reopen_subtitle = REOPEN_AFTER_CONSUMED;
+}
+
 static int64_t default_reload_interval(struct playlist *pls)
 {
     return pls->n_segments > 0 ?
@@ -988,7 +1008,7 @@ static int read_data(void *opaque, uint8_t *buf, int buf_size)
     int just_opened = 0;
 
 restart:
-    if (!v->needed)
+    if (!v->needed || v->reopen_subtitle)
         return AVERROR_EOF;
 
     if (!v->input) {
@@ -1070,6 +1090,7 @@ reload:
     v->cur_seq_no++;
 
     c->cur_seq_no = v->cur_seq_no;
+    after_segment_switch(v);
 
     goto restart;
 }
@@ -1430,6 +1451,7 @@ static int recheck_discard_flags(AVFormatContext *s, int first)
             changed = 1;
             pls->cur_seq_no = select_cur_seq_no(c, pls);
             pls->pb.eof_reached = 0;
+            after_segment_switch(pls);
             if (c->cur_timestamp != AV_NOPTS_VALUE) {
                 /* catch up */
                 pls->seek_timestamp = c->cur_timestamp;
@@ -1447,6 +1469,28 @@ static int recheck_discard_flags(AVFormatContext *s, int first)
         }
     }
     return changed;
+}
+
+static int reopen_subtitle_playlist(HLSContext *c, struct playlist *pls)
+{
+    /* each subtitle segment is demuxed separately */
+    struct AVFormatContext *newctx;
+    int ret;
+
+    pls->reopen_subtitle = NO_REOPEN;
+
+    if (!(newctx = avformat_alloc_context()))
+        return AVERROR(ENOMEM);
+
+    newctx->pb = &pls->pb;
+
+    ret = avformat_open_input(&newctx, NULL, pls->ctx->iformat, NULL);
+    if (ret == 0) {
+        avformat_close_input(&pls->ctx);
+        pls->ctx = newctx;
+    }
+
+    return ret;
 }
 
 static void fill_timing_for_id3_timestamped_stream(struct playlist *pls)
@@ -1506,11 +1550,21 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
             while (1) {
                 int64_t ts_diff;
                 AVRational tb;
+
+                if (pls->reopen_subtitle == REOPEN_BEFORE_READ)
+                    reopen_subtitle_playlist(c, pls);
+
                 ret = av_read_frame(pls->ctx, &pls->pkt);
+
                 if (ret < 0) {
                     if (!url_feof(&pls->pb) && ret != AVERROR_EOF)
                         return ret;
                     reset_packet(&pls->pkt);
+
+                    if (pls->reopen_subtitle &&
+                        reopen_subtitle_playlist(c, pls) == 0)
+                        continue;
+
                     break;
                 } else {
                     if (pls->is_id3_timestamped) {
@@ -1654,6 +1708,10 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
         /* Flush the packet queue of the subdemuxer. */
         ff_read_frame_flush(pls->ctx);
 
+        /* there are old subtitle packets in the demuxer buffer */
+        if (pls->reopen_subtitle == REOPEN_AFTER_CONSUMED)
+            pls->reopen_subtitle = REOPEN_BEFORE_READ;
+
         pls->seek_timestamp = seek_timestamp;
         pls->seek_flags = flags;
 
@@ -1666,6 +1724,7 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
             pls->seek_stream_index = -1;
             pls->seek_flags |= AVSEEK_FLAG_ANY;
         }
+        after_segment_switch(pls);
     }
 
     c->cur_timestamp = seek_timestamp;
