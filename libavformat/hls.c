@@ -1256,6 +1256,29 @@ static AVRational get_timebase(struct playlist *pls, int stream_index)
     return pls->ctx->streams[stream_index]->time_base;
 }
 
+static int compare_ts_with_wrapdetect(int64_t ts_a, AVRational tb_a,
+                                      int64_t ts_b, AVRational tb_b)
+{
+    /*
+     * Perform some rudimentary checking for timestamp discontinuities.
+     * This will not catch everything but should handle at least the
+     * spec-compliant case of all timestamps being MPEG TS timestamps...
+     * Commonly only a single playlist is played back at a time, anyway,
+     * so this code is not even reached.
+     */
+    int64_t scaled_ts_b = av_rescale_q(ts_b, tb_b, tb_a);
+    int64_t tsdiff = ts_a - scaled_ts_b;
+    if (FFABS(tsdiff) > (1LL << 31)) {
+        av_log(NULL, AV_LOG_VERBOSE, "Timestamp inconsistency of %f seconds between playlists, assuming a wrapped counter.\n",
+               FFABS(tsdiff) * av_q2d(tb_a));
+        tsdiff = -tsdiff;
+    }
+
+    if (tsdiff > 0) return 1;
+    if (tsdiff < 0) return -1;
+    return 0;
+}
+
 static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
 {
     HLSContext *c = s->priv_data;
@@ -1351,26 +1374,21 @@ start:
                 reset_packet(&pls->pkt);
             }
         }
-        /* Check if this stream still is on an earlier segment number, or
-         * has the packet with the lowest dts */
+        /* Check if this stream has the packet with the lowest dts */
         if (pls->pkt.data) {
             struct playlist *minpls = minplaylist < 0 ?
                                      NULL : c->playlists[minplaylist];
-            if (minplaylist < 0 || pls->cur_seq_no < minpls->cur_seq_no) {
+            if (minplaylist < 0) {
                 minplaylist = i;
-            } else if (pls->cur_seq_no == minpls->cur_seq_no) {
+            } else {
                 int64_t dts     =    pls->pkt.dts;
                 int64_t mindts  = minpls->pkt.dts;
                 AVRational tb    = get_timebase(   pls,    pls->pkt.stream_index);
                 AVRational mintb = get_timebase(minpls, minpls->pkt.stream_index);
 
-                if (dts == AV_NOPTS_VALUE) {
+                if (dts == AV_NOPTS_VALUE ||
+                    (mindts != AV_NOPTS_VALUE && compare_ts_with_wrapdetect(dts, tb, mindts, mintb) < 0))
                     minplaylist = i;
-                } else if (mindts != AV_NOPTS_VALUE) {
-                    if (av_compare_ts(dts, tb,
-                                      mindts, mintb) < 0)
-                        minplaylist = i;
-                }
             }
         }
     }
