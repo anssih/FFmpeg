@@ -1513,7 +1513,8 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
                     reset_packet(&pls->pkt);
                     break;
                 } else {
-                    if (pls->is_id3_timestamped) {
+                    /* stream_index check prevents matching picture attachments etc. */
+                    if (pls->is_id3_timestamped && pls->pkt.stream_index == 0) {
                         /* audio elementary streams are id3 timestamped */
                         fill_timing_for_id3_timestamped_stream(pls);
                     }
