@@ -3581,16 +3581,16 @@ FF_ENABLE_DEPRECATION_WARNINGS
         if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
             ff_rfps_add_frame(ic, st, pkt->dts);
 #endif
-        if (st->parser && st->parser->parser->split && !avctx->extradata) {
+        if (st->parser && st->parser->parser->split && !st->codecpar->extradata) {
             int i = st->parser->parser->split(avctx, pkt->data, pkt->size);
             if (i > 0 && i < FF_MAX_EXTRADATA_SIZE) {
-                avctx->extradata_size = i;
-                avctx->extradata      = av_mallocz(avctx->extradata_size +
-                                                   AV_INPUT_BUFFER_PADDING_SIZE);
-                if (!avctx->extradata)
+                st->codecpar->extradata_size = i;
+                st->codecpar->extradata      = av_mallocz(st->codecpar->extradata_size +
+                                                          AV_INPUT_BUFFER_PADDING_SIZE);
+                if (!st->codecpar->extradata)
                     return AVERROR(ENOMEM);
-                memcpy(avctx->extradata, pkt->data,
-                       avctx->extradata_size);
+                memcpy(st->codecpar->extradata, pkt->data,
+                       st->codecpar->extradata_size);
             }
         }
 
