@@ -1641,7 +1641,6 @@ static int hls_read_header(AVFormatContext *s)
             pls->id3_deferred_extra = NULL;
         }
 
-        pls->ctx->ctx_flags &= ~AVFMTCTX_NOHEADER;
         ret = avformat_find_stream_info(pls->ctx, NULL);
         if (ret < 0)
             goto fail;
