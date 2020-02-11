@@ -499,6 +499,7 @@ static int read_restart_header(MLPDecodeContext *m, GetBitContext *gbp,
         return AVERROR_INVALIDDATA;
     }
 
+    printf("output timestamp: %d\n", show_bits(gbp, 16));
     skip_bits(gbp, 16); /* Output timestamp */
 
     min_channel        = get_bits(gbp, 4);
@@ -1154,6 +1155,8 @@ static int read_access_unit(AVCodecContext *avctx, void* data,
     if (length < 4 || length > buf_size)
         return AVERROR_INVALIDDATA;
 
+    printf("input timestamp: %d\n", AV_RB16(buf + 2));
+
     init_get_bits(&gb, (buf + 4), (length - 4) * 8);
 
     m->is_major_sync_unit = 0;
@@ -1163,6 +1166,8 @@ static int read_access_unit(AVCodecContext *avctx, void* data,
         m->is_major_sync_unit = 1;
         header_size += m->major_sync_header_size;
     }
+
+    printf("length %d, major=%d\n", (int)length, !!m->is_major_sync_unit);
 
     if (!m->params_valid) {
         av_log(m->avctx, AV_LOG_WARNING,
