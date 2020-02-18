@@ -468,6 +468,10 @@ static int spdif_header_truehd(AVFormatContext *s, AVPacket *pkt)
                ctx->truehd_samples_per_frame);
     }
 
+    /* wait for major sync unit */
+    if (!ctx->truehd_samples_per_frame)
+        return 0;
+
     input_timing = AV_RB16(pkt->data + 2);
     if (ctx->truehd_prev_size) {
         uint16_t delta_samples = input_timing - ctx->truehd_prev_time;
@@ -512,16 +516,6 @@ static int spdif_header_truehd(AVFormatContext *s, AVPacket *pkt)
             memcpy(hd_buf->buf + mat_codes[next_code_idx].pos, mat_codes[next_code_idx].code, code_len);
             hd_buf->filled += code_len;
 
-            if (padding_remaining) {
-                /* consider the MAT code as padding */
-                int counted_as_padding = FFMIN(padding_remaining, code_len_remaining);
-                padding_remaining -= counted_as_padding;
-                code_len_remaining -= counted_as_padding;
-            }
-            /* count the remainder of the code as part of frame size */
-            if (code_len_remaining)
-                total_frame_size += code_len_remaining;
-
             next_code_idx++;
             if (next_code_idx == FF_ARRAY_ELEMS(mat_codes)) {
                 next_code_idx = 0;
@@ -533,7 +527,20 @@ static int spdif_header_truehd(AVFormatContext *s, AVPacket *pkt)
                 hd_buf = &ctx->hd_buf[ctx->hd_buf_idx];
                 hd_buf->filled = 0;
 //                 av_log(s, AV_LOG_ERROR, "HAVE_PKT 1\n");
+
+                /* inter-frame gap has to be counted as well, add it */
+                code_len_remaining += 61440 - MAT_FRAME_SIZE;
             }
+
+            if (padding_remaining) {
+                /* consider the MAT code as padding */
+                int counted_as_padding = FFMIN(padding_remaining, code_len_remaining);
+                padding_remaining -= counted_as_padding;
+                code_len_remaining -= counted_as_padding;
+            }
+            /* count the remainder of the code as part of frame size */
+            if (code_len_remaining)
+                total_frame_size += code_len_remaining;
         }
 //         av_log(s, AV_LOG_ERROR, "SY %d %d %d\n", hd_buf->filled, next_code_idx, mat_codes[next_code_idx].pos);
 
