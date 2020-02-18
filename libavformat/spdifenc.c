@@ -53,8 +53,14 @@
 #include "libavcodec/adts_parser.h"
 #include "libavcodec/dca.h"
 #include "libavcodec/dca_syncwords.h"
-#include "libavcodec/mlp_parse.h"
 #include "libavutil/opt.h"
+
+typedef struct HDBuffer {
+    uint8_t *buf;                ///< allocated buffer to concatenate hd audio frames
+    int size;                ///< size of the hd audio buffer
+    int count;               ///< number of frames in the hd audio buffer
+    int filled;              ///< amount of bytes in the hd audio buffer
+} HDBuffer;
 
 typedef struct IEC61937Context {
     const AVClass *av_class;
@@ -70,17 +76,13 @@ typedef struct IEC61937Context {
     int use_preamble;               ///< preamble enabled (disabled for exactly pre-padded DTS)
     int extra_bswap;                ///< extra bswap for payload (for LE DTS => standard BE DTS)
 
-    uint8_t *hackbuf;
-
-    uint8_t *hd_buf;                ///< allocated buffer to concatenate hd audio frames
-    int hd_buf_size;                ///< size of the hd audio buffer
-    int hd_buf_count;               ///< number of frames in the hd audio buffer
-    int hd_buf_filled;              ///< amount of bytes in the hd audio buffer
+    HDBuffer hd_buf[2];             ///< hd buffers
+    int hd_buf_idx;                 ///< active hd buffer index
 
     int dtshd_skip;                 ///< counter used for skipping DTS-HD frames
 
     uint16_t truehd_prev_time;      ///< input_timing from the last frame
-    int truehd_prev_size;
+    int truehd_prev_size;           ///< previous frame size in bytes, including any MAT codes
     int truehd_samples_per_frame;
 
     /* AVOptions: */
@@ -122,6 +124,7 @@ static int spdif_header_ac3(AVFormatContext *s, AVPacket *pkt)
 static int spdif_header_eac3(AVFormatContext *s, AVPacket *pkt)
 {
     IEC61937Context *ctx = s->priv_data;
+    HDBuffer *hd_buf = &ctx->hd_buf[ctx->hd_buf_idx];
     static const uint8_t eac3_repeat[4] = {6, 3, 2, 1};
     int repeat = 1;
 
@@ -129,25 +132,25 @@ static int spdif_header_eac3(AVFormatContext *s, AVPacket *pkt)
     if (bsid > 10 && (pkt->data[4] & 0xc0) != 0xc0) /* fscod */
         repeat = eac3_repeat[(pkt->data[4] & 0x30) >> 4]; /* numblkscod */
 
-    ctx->hd_buf = av_fast_realloc(ctx->hd_buf, &ctx->hd_buf_size, ctx->hd_buf_filled + pkt->size);
-    if (!ctx->hd_buf)
+    hd_buf->buf = av_fast_realloc(hd_buf->buf, &hd_buf->size, hd_buf->filled + pkt->size);
+    if (!hd_buf->buf)
         return AVERROR(ENOMEM);
 
-    memcpy(&ctx->hd_buf[ctx->hd_buf_filled], pkt->data, pkt->size);
+    memcpy(&hd_buf->buf[hd_buf->filled], pkt->data, pkt->size);
 
-    ctx->hd_buf_filled += pkt->size;
-    if (++ctx->hd_buf_count < repeat){
+    hd_buf->filled += pkt->size;
+    if (++hd_buf->count < repeat){
         ctx->pkt_offset = 0;
         return 0;
     }
     ctx->data_type   = IEC61937_EAC3;
     ctx->pkt_offset  = 24576;
-    ctx->out_buf     = ctx->hd_buf;
-    ctx->out_bytes   = ctx->hd_buf_filled;
-    ctx->length_code = ctx->hd_buf_filled;
+    ctx->out_buf     = hd_buf->buf;
+    ctx->out_bytes   = hd_buf->filled;
+    ctx->length_code = hd_buf->filled;
 
-    ctx->hd_buf_count  = 0;
-    ctx->hd_buf_filled = 0;
+    hd_buf->count  = 0;
+    hd_buf->filled = 0;
     return 0;
 }
 
@@ -175,6 +178,7 @@ static int spdif_header_dts4(AVFormatContext *s, AVPacket *pkt, int core_size,
                              int sample_rate, int blocks)
 {
     IEC61937Context *ctx = s->priv_data;
+    HDBuffer *hd_buf = &ctx->hd_buf[ctx->hd_buf_idx];
     static const char dtshd_start_code[10] = { 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfe, 0xfe };
     int pkt_size = pkt->size;
     int period;
@@ -235,15 +239,15 @@ static int spdif_header_dts4(AVFormatContext *s, AVPacket *pkt, int core_size,
      * with some receivers, but the exact requirement is unconfirmed. */
     ctx->length_code = FFALIGN(ctx->out_bytes + 0x8, 0x10) - 0x8;
 
-    av_fast_malloc(&ctx->hd_buf, &ctx->hd_buf_size, ctx->out_bytes);
-    if (!ctx->hd_buf)
+    av_fast_malloc(&hd_buf->buf, &hd_buf->size, ctx->out_bytes);
+    if (!hd_buf->buf)
         return AVERROR(ENOMEM);
 
-    ctx->out_buf = ctx->hd_buf;
+    ctx->out_buf = hd_buf->buf;
 
-    memcpy(ctx->hd_buf, dtshd_start_code, sizeof(dtshd_start_code));
-    AV_WB16(ctx->hd_buf + sizeof(dtshd_start_code), pkt_size);
-    memcpy(ctx->hd_buf + sizeof(dtshd_start_code) + 2, pkt->data, pkt_size);
+    memcpy(hd_buf->buf, dtshd_start_code, sizeof(dtshd_start_code));
+    AV_WB16(hd_buf->buf + sizeof(dtshd_start_code), pkt_size);
+    memcpy(hd_buf->buf + sizeof(dtshd_start_code) + 2, pkt->data, pkt_size);
 
     return 0;
 }
@@ -401,72 +405,57 @@ static int spdif_header_aac(AVFormatContext *s, AVPacket *pkt)
 #define TRUEHD_FRAME_OFFSET     2560
 #define MAT_MIDDLE_CODE_OFFSET  -4
 
-static void code_inserted(int code_size, int *padding_bytes_remain, int *total_bytes)
-{
-    int max_padding_remove = FFMIN(code_size, *padding_bytes_remain);
-    *padding_bytes_remain -= max_padding_remove;
+static const uint8_t mat_start_code[20] = {
+    0x07, 0x9E, 0x00, 0x03, 0x84, 0x01, 0x01, 0x01, 0x80, 0x00, 0x56, 0xA5, 0x3B, 0xF4, 0x81, 0x83,
+    0x49, 0x80, 0x77, 0xE0,
+};
+static const uint8_t mat_middle_code[12] = {
+    0xC3, 0xC1, 0x42, 0x49, 0x3B, 0xFA, 0x82, 0x83, 0x49, 0x80, 0x77, 0xE0,
+};
+static const uint8_t mat_end_code[16] = {
+    0xC3, 0xC2, 0xC0, 0xC4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x97, 0x11,
+};
 
-    *total_bytes += code_size - max_padding_remove;
-}
-
-static int insert_padding_and_copy_data(uint8_t *dest, int dest_bytes,
-                                        int *padding_bytes_remain,
-                                        const uint8_t **source, int *source_bytes_remain)
-{
-    int bytes_written = 0;
-
-    if (*padding_bytes_remain) {
-        int max_padding = FFMIN(*padding_bytes_remain, dest_bytes);
-        memset(dest, 0, max_padding);
-        bytes_written += max_padding;
-        *padding_bytes_remain -= max_padding;
-        dest_bytes -= max_padding;
-
-        if (dest_bytes == 0)
-            return bytes_written;
-    }
-
-    if (*source_bytes_remain) {
-        int max_bytes = FFMIN(*source_bytes_remain, dest_bytes);
-        memcpy(dest + bytes_written, *source, max_bytes);
-        bytes_written += max_bytes;
-        *source_bytes_remain -= max_bytes;
-        dest_bytes -= max_bytes;
-        *source += max_bytes;
-    }
-
-    return bytes_written;
-}
+static const struct {
+    unsigned int pos;
+    const uint8_t *code;
+    unsigned int len;
+} mat_codes[] = {
+    {
+        .pos = 0,
+        .code = mat_start_code,
+        .len = sizeof(mat_start_code),
+    },
+    {
+        .pos = 12 * TRUEHD_FRAME_OFFSET - BURST_HEADER_SIZE + MAT_MIDDLE_CODE_OFFSET,
+        .code = mat_middle_code,
+        .len = sizeof(mat_middle_code),
+    },
+    {
+        .pos = MAT_FRAME_SIZE - sizeof(mat_end_code),
+        .code = mat_end_code,
+        .len = sizeof(mat_end_code),
+    },
+};
 
 static int spdif_header_truehd(AVFormatContext *s, AVPacket *pkt)
 {
     IEC61937Context *ctx = s->priv_data;
-//     int mat_code_length = 0;
+    HDBuffer *hd_buf = &ctx->hd_buf[ctx->hd_buf_idx];
     int ratebits;
-    int extra_space = 0;
+    int padding_remaining = 0;
     uint16_t input_timing;
-    int total_size = pkt->size;
-    static int AXcount = 0;
-    static const char mat_end_code[16] = { 0xC3, 0xC2, 0xC0, 0xC4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x97, 0x11 };
-    static const int mat_end_code_pos = MAT_FRAME_SIZE - sizeof(mat_end_code);
+    int total_frame_size = pkt->size;
     const uint8_t *dataptr = pkt->data;
     int data_remaining = pkt->size;
     int have_pkt = 0;
+    int next_code_idx;
 
     if (pkt->size < 7)
         return AVERROR_INVALIDDATA;
 
-    // TODO the alignment should be very regular 24 normally, verify it is so with this code
-    // TODO check output_timing, does it explain the latency?
     if (AV_RB24(pkt->data + 4) == 0xf8726f) {
         /* major sync unit, fetch sample rate */
-//         MLPHeaderInfo info;
-//         GetBitContext gb;
-//         init_get_bits(&gb, pkt->data + 4, (pkt->size - 4) * 8);
-//         if (ff_mlp_read_major_sync(s, &info, &gb))
-//             return AVERROR_INVALIDDATA;
-//         ctx->truehd_samplerate = info.group1_samplerate;
-//         av_log(s, AV_LOG_ERROR, "got sample rate %d\n", ctx->truehd_samplerate);
         if (pkt->data[7] == 0xba && pkt->size >= 9)
             ratebits = pkt->data[8] >> 8;
         else if (pkt->data[7] == 0xbb && pkt->size >= 10)
@@ -475,7 +464,8 @@ static int spdif_header_truehd(AVFormatContext *s, AVPacket *pkt)
             return AVERROR_INVALIDDATA;
 
         ctx->truehd_samples_per_frame = 40 << (ratebits & 3);
-        av_log(s, AV_LOG_ERROR, "got samples per frame %d\n", ctx->truehd_samples_per_frame);
+        av_log(s, AV_LOG_TRACE, "TrueHD samples per frame: %d\n",
+               ctx->truehd_samples_per_frame);
     }
 
     input_timing = AV_RB16(pkt->data + 2);
@@ -487,94 +477,105 @@ static int spdif_header_truehd(AVFormatContext *s, AVPacket *pkt)
          * The nominal space per frame is therefore
          * (768000*4 bytes/sec) * (1/1200 sec) = 2560 bytes.
          * For multiple-of-44.1kHz frames: 1/1102.5 sec, 705.6kHz, 2560 bytes.
+         *
+         * 2560 is divisible by truehd_samples_per_frame.
          */
         int delta_bytes = delta_samples * 2560 / ctx->truehd_samples_per_frame;
-        extra_space = delta_bytes - ctx->truehd_prev_size;
 
-        if (extra_space < 0 || extra_space >= MAT_FRAME_SIZE) {
-            av_log(s, AV_LOG_WARNING, "XXYZ %d, delta samples %d, delta bytes %d\n", extra_space, delta_samples, delta_bytes);
-            extra_space = 0;
+        /* padding needed before this frame */
+        padding_remaining = delta_bytes - ctx->truehd_prev_size;
+
+        av_log(s, AV_LOG_TRACE, "delta_samples: %"PRIu16", delta_bytes: %d\n",
+               delta_samples, delta_bytes);
+
+        /* sanity check */
+        if (padding_remaining < 0 || padding_remaining >= MAT_FRAME_SIZE / 2) {
+            avpriv_request_sample(s, "Unusual frame timing: %"PRIu16" => %"PRIu16", %d samples/frame",
+                                  ctx->truehd_prev_time, input_timing, ctx->truehd_samples_per_frame);
+            padding_remaining = 0;
         }
     }
 
-    if (pkt->size >= 50 && 1) {
-        // bb: XX XX TS TS SYN SYN SYN SYN STRTYPE GR1GR2 RATEBITS+G2BITS
-        // ba: XX XX TS TS SYN SYN SYN SYN RATEBITS+G2BITS
-        av_log(s, AV_LOG_ERROR, "pkt->data first bytes: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x, pkt size %d, duration %d\n", pkt->data[0], pkt->data[1], pkt->data[2], pkt->data[3], pkt->data[4], pkt->data[5], pkt->data[6], pkt->data[7], pkt->data[8], pkt->data[9], pkt->data[10], pkt->data[11], pkt->size, (int)pkt->duration);
-    }
-
-    while (1) {
-        static const int mat_middle_code_pos = 12 * TRUEHD_FRAME_OFFSET - BURST_HEADER_SIZE + MAT_MIDDLE_CODE_OFFSET;
-        
-        if (ctx->hd_buf_filled == 0) {
-            static const char mat_start_code[20] = { 0x07, 0x9E, 0x00, 0x03, 0x84, 0x01, 0x01, 0x01, 0x80, 0x00, 0x56, 0xA5, 0x3B, 0xF4, 0x81, 0x83, 0x49, 0x80, 0x77, 0xE0 };
-            memcpy(ctx->hd_buf, mat_start_code, sizeof(mat_start_code));
-            code_inserted(sizeof(mat_start_code) + BURST_HEADER_SIZE, &extra_space, &total_size);
-            ctx->hd_buf_filled += sizeof(mat_start_code);
-        }
-
-        if (data_remaining == 0)
+    for (next_code_idx = 0; next_code_idx < FF_ARRAY_ELEMS(mat_codes); next_code_idx++)
+        if (hd_buf->filled <= mat_codes[next_code_idx].pos)
             break;
+//     av_log(s, AV_LOG_ERROR, "SA %d %d %d\n", hd_buf->filled, next_code_idx, mat_codes[next_code_idx].pos);
+ 
+    while (padding_remaining || data_remaining || mat_codes[next_code_idx].pos == hd_buf->filled) {
 
-        if (ctx->hd_buf_filled < mat_middle_code_pos) {
-            ctx->hd_buf_filled += insert_padding_and_copy_data(ctx->hd_buf + ctx->hd_buf_filled, mat_middle_code_pos - ctx->hd_buf_filled,
-                                                               &extra_space, &dataptr, &data_remaining);
-        }
+//         av_log(s, AV_LOG_ERROR, "ST %d %d %d\n", hd_buf->filled, next_code_idx, mat_codes[next_code_idx].pos);
+        if (mat_codes[next_code_idx].pos == hd_buf->filled) {
+            /* time to insert MAT code */
+            int code_len = mat_codes[next_code_idx].len;
+            int code_len_remaining = code_len;
+//             av_log(s, AV_LOG_ERROR, "SX %d %d %d\n", hd_buf->filled, next_code_idx, mat_codes[next_code_idx].pos);
+            memcpy(hd_buf->buf + mat_codes[next_code_idx].pos, mat_codes[next_code_idx].code, code_len);
+            hd_buf->filled += code_len;
 
-        if (ctx->hd_buf_filled == mat_middle_code_pos) {
-            static const char mat_middle_code[12] = { 0xC3, 0xC1, 0x42, 0x49, 0x3B, 0xFA, 0x82, 0x83, 0x49, 0x80, 0x77, 0xE0 };
-            memcpy(ctx->hd_buf + mat_middle_code_pos, mat_middle_code, sizeof(mat_middle_code));
-            code_inserted(sizeof(mat_middle_code), &extra_space, &total_size);
-            ctx->hd_buf_filled += sizeof(mat_middle_code);
-        }
-
-        if (data_remaining == 0)
-            break;
-        
-        if (ctx->hd_buf_filled < mat_end_code_pos) {
-            ctx->hd_buf_filled += insert_padding_and_copy_data(ctx->hd_buf + ctx->hd_buf_filled, mat_end_code_pos - ctx->hd_buf_filled,
-                                                               &extra_space, &dataptr, &data_remaining);
-        }            
-        if (data_remaining == 0)
-            break;        
-
-        if (ctx->hd_buf_filled == mat_end_code_pos) {
-            memcpy(ctx->hd_buf + mat_end_code_pos, mat_end_code, sizeof(mat_end_code));
-            code_inserted(sizeof(mat_end_code) + 8, &extra_space, &total_size);
-            ctx->hd_buf_filled += sizeof(mat_end_code);
-        }
-
-        if (ctx->hd_buf_filled == MAT_FRAME_SIZE) {
-            if (have_pkt) {
-                av_log(s, AV_LOG_ERROR, "AARGH1\n");
+            if (padding_remaining) {
+                /* consider the MAT code as padding */
+                int counted_as_padding = FFMIN(padding_remaining, code_len_remaining);
+                padding_remaining -= counted_as_padding;
+                code_len_remaining -= counted_as_padding;
             }
-            have_pkt = 1;
-            ctx->hd_buf_filled = 0;
-            memcpy(ctx->hackbuf, ctx->hd_buf, MAT_FRAME_SIZE);
+            /* count the remainder of the code as part of frame size */
+            if (code_len_remaining)
+                total_frame_size += code_len_remaining;
+
+            next_code_idx++;
+            if (next_code_idx == FF_ARRAY_ELEMS(mat_codes)) {
+                next_code_idx = 0;
+
+                /* this was the end-of-frame code, move to next MAT frame */
+                have_pkt = 1;
+                ctx->out_buf = hd_buf->buf;
+                ctx->hd_buf_idx ^= 1;
+                hd_buf = &ctx->hd_buf[ctx->hd_buf_idx];
+                hd_buf->filled = 0;
+//                 av_log(s, AV_LOG_ERROR, "HAVE_PKT 1\n");
+            }
         }
-        else {
-            av_log(s, AV_LOG_ERROR, "AARGH REFORMAT CODE\n");
+//         av_log(s, AV_LOG_ERROR, "SY %d %d %d\n", hd_buf->filled, next_code_idx, mat_codes[next_code_idx].pos);
+
+        if (padding_remaining) {
+            int padding_to_insert = FFMIN(mat_codes[next_code_idx].pos - hd_buf->filled, padding_remaining);
+
+//             av_log(s, AV_LOG_ERROR, "FX %d %d %d %d %d\n", padding_to_insert, next_code_idx, mat_codes[next_code_idx].pos, hd_buf->filled, padding_remaining);
+
+            memset(hd_buf->buf + hd_buf->filled, 0, padding_to_insert);
+            hd_buf->filled += padding_to_insert;
+            padding_remaining -= padding_to_insert;
+
+            if (padding_remaining)
+                continue; /* time to insert MAT code */
+        }
+
+        if (data_remaining) {
+            int data_to_insert = FFMIN(mat_codes[next_code_idx].pos - hd_buf->filled, data_remaining);
+
+            memcpy(hd_buf->buf + hd_buf->filled, dataptr, data_to_insert);
+            hd_buf->filled += data_to_insert;
+            dataptr += data_to_insert;
+            data_remaining -= data_to_insert;
         }
     }
 
-    ctx->truehd_prev_size = total_size;
+    ctx->truehd_prev_size = total_frame_size;
     ctx->truehd_prev_time = input_timing;
-    av_log(s, AV_LOG_ERROR, "frame inserted, size %d, bufpos %d\n", total_size, ctx->hd_buf_filled);
 
-    AXcount++;
+    av_log(s, AV_LOG_TRACE, "TrueHD frame inserted, total size %d, buffer position %d\n",
+           total_frame_size, hd_buf->filled);
+
     if (!have_pkt) {
         ctx->pkt_offset = 0;
         return 0;
     }
 
-    av_log(s, AV_LOG_ERROR, "got %d frames in one packet\n", AXcount);
-    AXcount = 0;
-
     ctx->data_type   = IEC61937_TRUEHD;
     ctx->pkt_offset  = 61440;
-    ctx->out_buf     = ctx->hackbuf;
     ctx->out_bytes   = MAT_FRAME_SIZE;
     ctx->length_code = MAT_FRAME_SIZE;
+//                 av_log(s, AV_LOG_ERROR, "RDY TO OUTPUT 1\n");
     return 0;
 }
 
@@ -603,14 +604,11 @@ static int spdif_write_header(AVFormatContext *s)
     case AV_CODEC_ID_TRUEHD:
     case AV_CODEC_ID_MLP:
         ctx->header_info = spdif_header_truehd;
-        ctx->hd_buf = av_malloc(MAT_FRAME_SIZE);
-        memset(ctx->hd_buf, 0, MAT_FRAME_SIZE);
-        if (!ctx->hd_buf)
-            return AVERROR(ENOMEM);
-        ctx->hackbuf = av_malloc(MAT_FRAME_SIZE);
-        memset(ctx->hackbuf, 0, MAT_FRAME_SIZE);
-        if (!ctx->hackbuf)
-            return AVERROR(ENOMEM);
+        for (int i; i < FF_ARRAY_ELEMS(ctx->hd_buf); i++) {
+            ctx->hd_buf[i].buf = av_mallocz(MAT_FRAME_SIZE);
+            if (!ctx->hd_buf[i].buf)
+                return AVERROR(ENOMEM);
+        }
         break;
     default:
         avpriv_report_missing_feature(s, "Codec %d",
@@ -624,7 +622,8 @@ static int spdif_write_trailer(AVFormatContext *s)
 {
     IEC61937Context *ctx = s->priv_data;
     av_freep(&ctx->buffer);
-    av_freep(&ctx->hd_buf);
+    for (int i = 0; i < FF_ARRAY_ELEMS(ctx->hd_buf); i++)
+        av_freep(&ctx->hd_buf[i].buf);
     return 0;
 }
 
@@ -699,6 +698,6 @@ AVOutputFormat ff_spdif_muxer = {
     .write_header      = spdif_write_header,
     .write_packet      = spdif_write_packet,
     .write_trailer     = spdif_write_trailer,
-    .flags             = AVFMT_NOTIMESTAMPS,
+    .flags             = AVFMT_NOTIMESTAMPS | AVFMT_TS_NONSTRICT,
     .priv_class        = &spdif_class,
 };
